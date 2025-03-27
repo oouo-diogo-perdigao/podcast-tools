@@ -14,6 +14,7 @@ from pynput import keyboard
 from typing import Literal, cast
 from dotenv import load_dotenv
 from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
+from whisper import available_models
 from whisper.transcribe import transcribe
 from whisper.utils import (
     WriteSRT,
@@ -24,6 +25,9 @@ from whisper.utils import (
 )
 from threading import Thread
 from pyannote.core import Segment, Annotation, Timeline
+from io import StringIO
+import re
+import requests
 
 # load environment variables
 load_dotenv()
@@ -78,7 +82,7 @@ class VttSpkGenerator:
         )
 
     def play_30(self, audio_path):
-        print("\n🔊 {audio_path} (pressione qualquer tecla para pular)")
+        print(f"\n🔊 {audio_path} (press any key to skip)")
 
         def on_press(self, key):
             self.skip = True
@@ -107,7 +111,7 @@ class VttSpkGenerator:
                 self.process.wait()
 
         except Exception as e:
-            print(f"\n❌ Erro ao reproduzir o áudio: {str(e)}")
+            print(f"\n❌ Play audio .mp3 completed: {str(e)}")
         finally:
             if self.listener:
                 self.listener.stop()
@@ -137,7 +141,10 @@ class VttSpkGenerator:
                 language=self.language,
             )
 
+            self.preprocess_save(transcribeResult, mp3_path.with_suffix(".process"))
+
             print(f"\n🔨 pre-transcribe finished")
+            print(f"\n✅ .PROCESS created: {mp3_path.parent}/{mp3_path.name}")
             print(f"\n{'='*40}")
 
             return transcribeResult
@@ -182,7 +189,7 @@ class VttSpkGenerator:
                 WriteSRT(mp3_path.parent).write_result(transcribeResult, file=file)
 
         print(
-            f"\n✅ {output_format.upper()} created: {mp3_path.parent}/{mp3_path.name}"
+            f"\n✅ .{output_format.upper()} created: {mp3_path.parent}/{mp3_path.name}"
         )
 
     def process_spk(self, mp3_path, transcribeResult):
@@ -217,6 +224,8 @@ class VttSpkGenerator:
                     line = f"{seg.start:.2f} {seg.end:.2f} {spk} {sentence}\n"
                     file.write(line)
 
+            print(f"\n✅ .SPK created: {mp3_path.parent}/{mp3_path.name}")
+
             print(f"\n🔨 Diarization finished")
             print(f"\n{'='*40}")
 
@@ -226,7 +235,119 @@ class VttSpkGenerator:
             return None
 
     def process_resume(self, mp3_path, transcribeResult):
-        print("not yet implemented")
+        """Generate resume with AI API"""
+
+        API_CONFIG = {
+            "openai": {
+                "url": "https://api.openai.com/v1/chat/completions",
+                "key": os.getenv("OPENAI_API_KEY"),
+                "model": "gpt-4",
+                "headers": lambda key: {"Authorization": f"Bearer {key}"},
+            },
+            "deepseek": {
+                "url": "https://api.deepseek.com/v1/chat/completions",
+                "key": os.getenv("DEEPSEEK_API_KEY"),
+                "model": "deepseek-chat",
+                "headers": lambda key: {"Authorization": f"Bearer {key}"},
+            },
+        }
+
+        audio_basename = re.sub(
+            r"\.mp3$", "", os.path.basename(mp3_path), flags=re.IGNORECASE
+        )
+
+        # Corrigir geração do transcript
+        buffer = StringIO()
+        WriteTXT(mp3_path.parent).write_result(transcribeResult, file=buffer)
+        transcript = buffer.getvalue()
+
+        buffer.close()
+
+        prompt = (
+            "Crie um resumo jornalístico de uma sessão de RPG baseado na transcrição abaixo.\n"
+            "Estrutura requerida:\n"
+            "- Primeiro parágrafo: visão geral concisa (3-5 frases) com os fatos principais\n"
+            "- Parágrafos seguintes: detalhamento dos eventos mais relevantes (2-4 parágrafos)\n"
+            "Características:\n"
+            "- Tom formal e imparcial\n"
+            "- Estilo similar a reportagem\n"
+            "- Destaque para decisões importantes e eventos cruciais\n"
+            "- Evite gírias e mantenha coerência temporal\n"
+            f"Transcrição:\n{transcript}"
+        )
+
+        summary = None
+        service = None
+
+        # Tentar serviços em ordem de preferência
+        for service_name in ["openai", "deepseek"]:
+            config = API_CONFIG[service_name]
+            if config["key"]:
+                try:
+                    headers = {
+                        "Content-Type": "application/json",
+                        **config["headers"](config["key"]),
+                    }
+
+                    payload = {
+                        "model": config["model"],
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "Você é um jornalista experiente resumindo eventos de uma sessão de RPG.",
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": 1000,
+                    }
+
+                    print("\n=== Debug: Sending Request ===")
+
+                    start_time = time.time()
+
+                    response = requests.post(
+                        config["url"], headers=headers, json=payload, timeout=300
+                    )
+
+                    elapsed = time.time() - start_time
+                    print(f"⏱️ Response time: {elapsed:.2f}s")
+
+                    response.raise_for_status()  # Lança exceção para status 4xx/5xx
+
+                    print(f"✅ {service_name} response: {response.status_code}")
+                    summary = response.json()["choices"][0]["message"]["content"]
+
+                    response.raise_for_status()  # Isso vai levantar uma exceção para códigos 4xx/5xx
+
+                    if response.status_code == 200:
+                        summary = response.json()["choices"][0]["message"]["content"]
+                        service = service_name
+                        break
+                    else:
+                        print(
+                            f"Error {service_name} ({response.status_code}): {response.text}"
+                        )
+                except requests.exceptions.ConnectionError as e:
+                    print(f"❌ Connection failed to {service_name}: {str(e)}")
+                except requests.exceptions.Timeout:
+                    print(f"⏰ Timeout connecting to {service_name} (5s)")
+                except requests.exceptions.HTTPError as e:
+                    print(f"🚨 HTTP error from {service_name}: {str(e)}")
+                except Exception as e:
+                    print(f"⚠️ Unexpected error with {service_name}: {str(e)}")
+                continue
+
+        if summary:
+            output_file = os.path.join(mp3_path.parent, f"{audio_basename}.resume")
+
+            with open(output_file, "w", encoding="utf-8") as file:
+                file.write(f"Resume created by {service}:\n\n{summary}")
+            print(f"\n✅ .RESUME created: {mp3_path.parent}/{mp3_path.name}")
+            return summary
+
+        print("\n❌ No AI service available (check your API Keys)")
+        return None
 
     def preprocess_save(self, obj, file_path):
         """Save Python object in .process file using pickle."""
@@ -290,7 +411,7 @@ class VttSpkGenerator:
 
 
 # region (collapsed) Funções auxiliares locais
-def listar_arquivos_mp3(pasta_base):
+def listar_arquivos_mp3(pasta_base: list[str]) -> list[Path]:
     mp3_files = []
 
     for item in pasta_base:
@@ -316,7 +437,7 @@ def listar_arquivos_mp3(pasta_base):
     return mp3_files
 
 
-def contar(mp3_files):
+def report(mp3_files, args):
     status = []
     for mp3 in mp3_files:
         # verifica se existe um arquivo .vtt com o nome do mp3 na mesma pasta
@@ -337,11 +458,11 @@ def contar(mp3_files):
             ]
         )
 
-    print("\n📊 Status dos Arquivos:")
+    print("\n📊 Status the Files:")
     print(
         tabulate(
             status,
-            headers=["Arquivo", "Pasta", "Process", "VTT", "SPK", "SRT", "RESUME"],
+            headers=["File", "Folder", "Process", "VTT", "SPK", "SRT", "RESUME"],
             tablefmt="grid",
             showindex=True,
         )
@@ -355,20 +476,18 @@ def contar(mp3_files):
 
     print(
         f"""
-        ⚙️ process: {process} / {total} {(process/total)*100:.0f}%
-        📝 VTT: {vtt} / {total} {(vtt/total)*100:.0f}%
-        🔢 SPK: {spk} / {total} {(spk/total)*100:.0f}%
-        📝 SRT: {srt} / {total} {(srt/total)*100:.0f}%
-        📝 RESUME: {resume} / {total} {(resume/total)*100:.0f}%
+        Generate --process is {"✅" if args.process else "❌"}       ⚙️ process: {process} / {total} {(process/total)*100:.0f}%
+        Generate --spk is     {"✅" if args.spk     else "❌"}       📝 VTT: {vtt} / {total} {(vtt/total)*100:.0f}%
+        Generate --vtt is     {"✅" if args.vtt     else "❌"}       🔢 SPK: {spk} / {total} {(spk/total)*100:.0f}%
+        Generate --srt is     {"✅" if args.srt     else "❌"}       📝 SRT: {srt} / {total} {(srt/total)*100:.0f}%
+        Generate --resume is  {"✅" if args.resume  else "❌"}       📝 RESUME: {resume} / {total} {(resume/total)*100:.0f}%
         """
     )
 
-    return total, vtt, spk, srt, resume
+    return total, process, vtt, spk, srt, resume
 
 
 def getArgs():
-    from whisper import available_models
-
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description="Processador de Áudio RPG",
@@ -378,7 +497,7 @@ def getArgs():
     )
     parser.add_argument(
         "--ls",
-        default=False,
+        action="store_true",  # default=False,
         help="Only list files and process",
     )
     parser.add_argument(
@@ -414,27 +533,28 @@ def getArgs():
         help="language spoken in the audio, specify None to perform language detection",
     )
     parser.add_argument(
+        "--process",
+        action="store_true",  # default=False,
+        help="Generate process file",
+    )
+    parser.add_argument(
         "--vtt",
-        type=str2bool,
-        default=False,
+        action="store_true",  # default=False,
         help="Generate vtt file",
     )
     parser.add_argument(
-        "--srt",
-        type=str2bool,
-        default=False,
-        help="Generate srt file by pyannote",
-    )
-    parser.add_argument(
         "--spk",
-        type=str2bool,
-        default=False,
+        action="store_true",  # default=False,
         help="Generate spk file by pyannote",
     )
     parser.add_argument(
+        "--srt",
+        action="store_true",  # default=False,
+        help="Generate srt file by pyannote",
+    )
+    parser.add_argument(
         "--resume",
-        type=str2bool,
-        default=False,
+        action="store_true",  # default=False,
         help="Generate resume file by gpt-4",
     )
     return parser.parse_args()
@@ -447,7 +567,8 @@ def main():
     args = getArgs()
 
     mp3_files = listar_arquivos_mp3(args.audio)
-    contar(mp3_files)
+    total, process, vtt, spk, srt, resume = report(mp3_files, args)
+
     if args.ls:
         return
 
@@ -457,23 +578,45 @@ def main():
         model=args.model,
         device=args.device,
         threads=args.threads,
+        whisper=args.process and (total - process > 0),  # only load whisper if need
+        pyannote=args.spk and (total - spk > 0),  # only load pyannote if need
     )
 
+    # create queues
+    process_queue = queue.Queue()
+    spk_queue = queue.Queue()
+    vtt_queue = queue.Queue()
+    srt_queue = queue.Queue()
+    resume_queue = queue.Queue()
+
     def spk_worker():
-        """ "Iniciar um worker para vigiar uma fila, que processara .vtt inseridos nela"""
-        while True:
-            mp3, transcribe = spk_queue.get()
-            if not mp3.with_suffix(".spk").exists():
-                controller.process_spk(mp3, transcribe)
-            spk_queue.task_done()
+        """ "Start a thread to process spk files"""
+        while args.spk:
+            try:
+                mp3_path, transcribe = spk_queue.queue[0]  # only see the first item
+            except IndexError:
+                time.sleep(1)
+                continue
+
+            if not mp3_path.with_suffix(".spk").exists():
+                try:
+                    controller.process_spk(mp3_path, transcribe)
+                    # only remove success
+                    spk_queue.get()
+                    spk_queue.task_done()
+                except Exception as e:
+                    print(f"Error to process {mp3_path.name}, trying again: {str(e)}")
+                    time.sleep(5)
+            else:
+                spk_queue.get()
+                spk_queue.task_done()
 
     thread_spk = Thread(target=spk_worker, daemon=True)
     thread_spk.start()
 
-    spk_queue = queue.Queue()  # fila de diarização
-
     if args.spk:
-        # primeiro percorre os arquivos .txt salvos de outras iterações e adiciona eles na fila de diarização
+        notprocessed = []
+        # loop for get .process files ready to process spk
         for mp3_path in mp3_files:
             if (
                 mp3_path.with_suffix(".process").exists()
@@ -483,21 +626,43 @@ def main():
                     mp3_path.with_suffix(".process")
                 )
                 spk_queue.put([mp3_path, transcribeResult])
+            else:
+                notprocessed.append(mp3_path)
+        if args.process and notprocessed.count > 0:
+            print(
+                "\n🔍 Need process {notprocessed.count} files for use spk generate..."
+            )
+    else:
+        thread_spk.join()
 
     def vtt_worker():
-        while True:
-            mp3, transcribe = vtt_queue.get()
-            if not mp3.with_suffix(".vtt").exists():
-                controller.process_whisper_format(mp3, transcribe, "vtt")
-            vtt_queue.task_done()
+        """ "Start a thread to process vtt files"""
+        while args.vtt:
+            try:
+                mp3_path, transcribe = vtt_queue.queue[0]  # only see the first item
+            except IndexError:
+                time.sleep(1)
+                continue
+
+            if not mp3_path.with_suffix(".vtt").exists():
+                try:
+                    controller.process_whisper_format(mp3_path, transcribe, "vtt")
+                    # only remove success
+                    vtt_queue.get()
+                    vtt_queue.task_done()
+                except Exception as e:
+                    print(f"Error to process {mp3_path.name}, trying again: {str(e)}")
+                    time.sleep(5)
+            else:
+                vtt_queue.get()
+                vtt_queue.task_done()
 
     thread_vtt = Thread(target=vtt_worker, daemon=True)
     thread_vtt.start()
 
-    vtt_queue = queue.Queue()
-
     if args.vtt:
-        # primeiro percorre os arquivos .txt salvos de outras iterações e adiciona eles na fila de diarização
+        notprocessed = []
+        # loop for get .process files ready to process vtt
         for mp3_path in mp3_files:
             if (
                 mp3_path.with_suffix(".process").exists()
@@ -507,21 +672,44 @@ def main():
                     mp3_path.with_suffix(".process")
                 )
                 vtt_queue.put([mp3_path, transcribeResult])
+            else:
+                notprocessed.append(mp3_path)
+        if args.process and notprocessed.count > 0:
+            print(
+                "\n🔍 Need process {notprocessed.count} files for use vtt generate..."
+            )
+    else:
+        thread_vtt.join()
 
     def srt_worker():
-        while True:
-            mp3, transcribe = srt_queue.get()
-            if not mp3.with_suffix(".srt").exists():
-                controller.process_whisper_format(mp3, transcribe, "srt")
-            srt_queue.task_done()
+        """ "Start a thread to process srt files"""
+        while args.srt:
+            try:
+                mp3_path, transcribe = srt_queue.queue[0]  # only see the first item
+            except IndexError:
+                time.sleep(1)
+                continue
+
+            if not mp3_path.with_suffix(".srt").exists():
+                try:
+                    controller.process_whisper_format(mp3_path, transcribe, "srt")
+                    # only remove success
+                    srt_queue.get()
+                    srt_queue.task_done()
+                except Exception as e:
+                    print(f"Error to process {mp3_path.name}, trying again: {str(e)}")
+                    time.sleep(5)
+            else:
+                # Já existe, remove da fila
+                srt_queue.get()
+                srt_queue.task_done()
 
     thread_srt = Thread(target=srt_worker, daemon=True)
     thread_srt.start()
 
-    srt_queue = queue.Queue()
-
     if args.srt:
-        # primeiro percorre os arquivos .txt salvos de outras iterações e adiciona eles na fila de diarização
+        notprocessed = []
+        # loop for get .process files ready to process srt
         for mp3_path in mp3_files:
             if (
                 mp3_path.with_suffix(".process").exists()
@@ -531,21 +719,43 @@ def main():
                     mp3_path.with_suffix(".process")
                 )
                 srt_queue.put([mp3_path, transcribeResult])
+            else:
+                notprocessed.append(mp3_path)
+        if args.process and notprocessed.count > 0:
+            print(
+                "\n🔍 Need process {notprocessed.count} files for use srt generate..."
+            )
+    else:
+        thread_srt.join()
 
     def resume_worker():
-        while True:
-            mp3, transcribe = resume_queue.get()
-            if not mp3.with_suffix(".resume").exists():
-                controller.process_resume(mp3, transcribe)
-            resume_queue.task_done()
+        """ "Start a thread to process resume files"""
+        while args.resume:
+
+            try:
+                mp3_path, transcribe = resume_queue.queue[0] # only see the first item
+            except IndexError:
+                time.sleep(1)
+                continue
+
+            if not mp3_path.with_suffix(".resume").exists():
+                try:
+                    controller.process_resume(mp3_path, transcribe)
+                    # only remove success
+                    resume_queue.get()
+                    resume_queue.task_done()
+                except Exception as e:
+                    print(f"Error to process {mp3_path.name}, trying again: {str(e)}")
+                    time.sleep(5)
+            else:
+                resume_queue.get()
+                resume_queue.task_done()
 
     thread_resume = Thread(target=resume_worker, daemon=True)
     thread_resume.start()
 
-    resume_queue = queue.Queue()
-
     if args.resume:
-        # primeiro percorre os arquivos .txt salvos de outras iterações e adiciona eles na fila de diarização
+        notprocessed = []
         for mp3_path in mp3_files:
             if (
                 mp3_path.with_suffix(".process").exists()
@@ -555,44 +765,85 @@ def main():
                     mp3_path.with_suffix(".process")
                 )
                 resume_queue.put([mp3_path, transcribeResult])
+            else:
+                notprocessed.append(mp3_path)
+        if args.process and notprocessed.count > 0:
+            print("\n🔍 Need process {notprocessed.count} files for use resume")
+    else:
+        thread_resume.join()
 
-    # create .process for mp3 files that do not have
-    pendentes = [f for f in mp3_files if not f.with_suffix(".process").exists()]
-    for idx, mp3_path in enumerate(pendentes, 1):
-        print(f"📁 File {idx}/{len(pendentes)}")
+    def process_worker():
+        """ "Start a thread to process process files"""
 
-        transcribeResult = controller.preprocess(mp3_path)
-        controller.preprocess_save(transcribeResult, mp3_path.with_suffix(".process"))
-        controller.play_30(mp3_path)
+        while args.process:
+            # Verifica o próximo item sem removê-lo
+            try:
+                mp3_path = process_queue.queue[0]  # Apenas olha o primeiro item
+            except IndexError:
+                time.sleep(1)
+                continue
 
-        if idx < len(pendentes):
-            ("Next file")
+            if not mp3_path.with_suffix(".process").exists():
+                print(f"\n🔨 Starting process... {mp3_path}")
+                try:
+                    transcribeResult = controller.preprocess(mp3_path)
+                    controller.play_30(mp3_path)
 
-        if args.spk:
-            if mp3_path.with_suffix(".vtt").exists():
-                spk_queue.put([mp3_path, transcribeResult])
+                    if args.spk:
+                        if not mp3_path.with_suffix(".spk").exists():
+                            spk_queue.put([mp3_path, transcribeResult])
 
-        if args.vtt:
-            if mp3_path.with_suffix(".process").exists():
-                spk_queue.put([mp3_path, transcribeResult])
+                    if args.vtt:
+                        if not mp3_path.with_suffix(".vtt").exists():
+                            vtt_queue.put([mp3_path, transcribeResult])
 
-        if args.srt:
-            if mp3_path.with_suffix(".process").exists():
-                srt_queue.put([mp3_path, transcribeResult])
+                    if args.srt:
+                        if not mp3_path.with_suffix(".srt").exists():
+                            srt_queue.put([mp3_path, transcribeResult])
 
-        if args.resume:
-            if mp3_path.with_suffix(".process").exists():
-                resume_queue.put([mp3_path, transcribeResult])
+                    if args.resume:
+                        if not mp3_path.with_suffix(".resume").exists():
+                            resume_queue.put([mp3_path, transcribeResult])
 
-    # Aguarda a conclusão da thread_spk antes de prosseguir
-    thread_spk.join()
-    thread_vtt.join()
-    thread_srt.join()
-    thread_resume.join()
+                    # Só remove se processou com sucesso
+                    process_queue.get()
+                    process_queue.task_done()
+                except Exception as e:
+                    print(f"Error to process {mp3_path.name}, trying again: {str(e)}")
+                    time.sleep(5)
+            else:
+                # Já existe, remove da fila
+                process_queue.get()
+                process_queue.task_done()
+
+    thread_process = Thread(target=process_worker, daemon=True)
+    thread_process.start()
+
+    if args.process:
+        for mp3_path in mp3_files:
+            if not mp3_path.with_suffix(".process").exists():
+                process_queue.put(mp3_path)
+                thread_process.join()  # force 1 by 1 processing, test your machine before remove this line
+    else:
+        thread_process.join()
+
+    # finish all threads
+    print("\n🔚 All threads don't have work?")
+    # if a all queue is empty the thread is finished
+    while not (
+        process_queue.empty()
+        and spk_queue.empty()
+        and vtt_queue.empty()
+        and srt_queue.empty()
+        and resume_queue.empty()
+    ):
+        time.sleep(1)
+    report(mp3_files, args)
+    print("\n🔚 Work Done")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n🛑 Execução interrompida pelo usuário!")
+        print("\n� Skipped by user")
